@@ -44,6 +44,15 @@ import tf2_ros
 import tf_conversions
 from copy import deepcopy
 
+import sys
+import rospy as ros
+from actionlib import SimpleActionClient
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from control_msgs.msg import FollowJointTrajectoryAction, \
+                             FollowJointTrajectoryGoal, FollowJointTrajectoryResult
+from std_msgs.msg import Bool
+
 # Maybe these can be removed if we have a different way of sending commands
 import sys
 from trajectory_msgs.msg import JointTrajectory
@@ -51,19 +60,30 @@ from sensor_msgs.msg import JointState
 
 
 # The neutral configuration at which to start the node
-NEUTRAL_CONFIG = np.array(
-    [
-        -0.01779206,
-        -0.76012354,
-        0.01978261,
-        -2.34205014,
-        0.02984053,
-        1.54119353,
-        0.75344866,
-        0.025,
-        0.025,
-    ]
-)
+# NEUTRAL_CONFIG = np.array(
+#     # [
+#     #     -0.01779206,
+#     #     -0.76012354,
+#     #     0.01978261,
+#     #     -2.34205014,
+#     #     0.02984053,
+#     #     1.54119353,
+#     #     0.75344866,
+#     #     0.025,
+#     #     0.025,
+#     # ]
+#     [
+#         -0.007361705422466784, 
+#         -0.7726362141893675, 
+#         0.0018630187641415542, 
+#         -2.359506891750965, 
+#         8.746612392051592e-05, 
+#         1.5608381649188636, 
+#         0.7879129269900202, 
+#         0.0403607040643692, 
+#         0.0403607040643692
+#     ]
+# )
 
 # A neutral starting target (matches the end effector of the neutral start)
 NEUTRAL_TARGET_XYZ = [0.30649957127333377, 0.007287351995245575, 0.4866376674460814]
@@ -100,6 +120,13 @@ class MPiNetsInterface:
         # rospy.Timer(rospy.Duration.from_sec(0.01), self.frame_callback)
         # Not sure why this is here, but ok
 
+        # initialize client for franka control
+        action = ros.resolve_name('~follow_joint_trajectory')
+        self.client = SimpleActionClient(action, FollowJointTrajectoryAction)
+        self.client.wait_for_server()
+
+        # TODO: get joint states from franka controller eventually
+
         self.make_execute_button_marker([1.0, -1.0, 0.1], 0.2)
         self.make_plan_button_marker([0.7, -1.0, 0.1], 0.2)
         self.make_reset_button_marker([0.4, -1.0, 0.1], 0.2)
@@ -109,7 +136,9 @@ class MPiNetsInterface:
         self.current_plan = []
         self.target_xyz = NEUTRAL_TARGET_XYZ
         self.target_xyzw = NEUTRAL_TARGET_XYZW
-        self.current_joint_state = NEUTRAL_CONFIG
+        self.neutral_config = None
+        self.should_reset_neutral = True
+        self.current_joint_state = self.neutral_config
         self.make_target_marker(
             self.target_xyz,
             self.target_xyzw,
@@ -118,11 +147,11 @@ class MPiNetsInterface:
         self.planning_problem_publisher = rospy.Publisher(
             "/mpinets/planning_problem", PlanningProblem, queue_size=1
         )
-        self.joint_states_publisher = rospy.Publisher(
-            "/mpinets/joint_states",
-            JointState,
-            queue_size=1,
-        )
+        # self.joint_states_publisher = rospy.Publisher(
+        #     "/mpinets/joint_states",
+        #     JointState,
+        #     queue_size=1,
+        # )
 
         self.planned_joint_states_publisher = rospy.Publisher(
             "/mpinets/planned_joint_states",
@@ -136,8 +165,48 @@ class MPiNetsInterface:
             self.planning_callback,
             queue_size=5,
         )
+
+        self.joint_states_subscriber = rospy.Subscriber(
+            "/joint_states",
+            JointState,
+            self.joint_state_callback,
+            queue_size=1,
+        )
+
+        self.reset_neutral_subscriber = rospy.Subscriber(
+            "/reset_neutral", 
+            Bool, 
+            self.reset_neutral_callback, 
+            size=1,
+        )
+
         time.sleep(1)
         self.reset_franka()
+
+    def reset_neutral_callback(self, msg):
+        self.should_reset_neutral = True
+
+    def joint_state_callback(self, msg):
+        """
+        Sets the neutral config of the robot
+
+        :param msg JointState: The current joint state of the robot
+        """
+        if self.should_reset_neutral:
+            self.neutral_config = np.array(
+                [
+                    msg.position[0], 
+                    msg.position[1], 
+                    msg.position[2], 
+                    msg.position[3], 
+                    msg.position[4], 
+                    msg.position[5], 
+                    msg.position[6], 
+                    msg.position[7], 
+                    #msg.position[8] # TODO: remove? PLANNER EXPECTS 7 and gives back 7 (add on finger control - 0.025)
+                ]
+            )
+            self.should_reset_neutral = False
 
     def reset_franka(self):
         """
@@ -146,12 +215,12 @@ class MPiNetsInterface:
         msg = JointState()
         msg.header.stamp = rospy.Time.now()
         msg.header.frame_id = "panda_link0"
-        msg.position = NEUTRAL_CONFIG
+        msg.position = self.neutral_config
         msg.name = JOINT_NAMES
         self.visualize_plan = False
         self.joint_states_publisher.publish(msg)
         self.planned_joint_states_publisher.publish(msg)
-        self.current_joint_state = NEUTRAL_CONFIG
+        self.current_joint_state = self.neutral_config # TODO
         self.current_plan = []
 
     @staticmethod
@@ -397,7 +466,7 @@ class MPiNetsInterface:
         :param msg JointTrajectory: The trajectory coming back from the planning node
         """
         self.current_plan = [
-            list(point.positions) + NEUTRAL_CONFIG[7:].tolist() for point in msg.points
+            list(point.positions) + self.neutral_config[7:].tolist() for point in msg.points
         ]
         while self.visualize_plan:
             for q in self.current_plan:
@@ -460,14 +529,31 @@ class MPiNetsInterface:
                 return
             self.visualize_plan = False
             self.current_joint_state = self.current_plan[-1]
+
+            goal = FollowJointTrajectoryGoal()
+
             for q in self.current_plan:
                 joint_msg = JointState()
                 joint_msg.header.stamp = rospy.Time.now()
                 joint_msg.header.frame_id = "panda_link0"
                 joint_msg.position = q
                 joint_msg.name = JOINT_NAMES
-                self.joint_states_publisher.publish(joint_msg)
-                self.planned_joint_states_publisher.publish(joint_msg)
+                #self.joint_states_publisher.publish(joint_msg) # TODO: can remov
+                self.planned_joint_states_publisher.publish(joint_msg) # keep this for ghost mesh
+
+                # create joint trajectory goal
+                goal.trajectory.joint_names = JOINT_NAMES
+                goal.trajectory.points.append(q)
+                goal.goal_time_tolerance = ros.Duration.from_sec(0.5)
+
+                # send goal to franka controller
+                self.client.send_goal_and_wait(goal)
+
+            # verify that the movement was a success
+                result = self.client.get_result()
+                if result.error_code != FollowJointTrajectoryResult.SUCCESSFUL:
+                    ros.logerr('planning_callback: Movement was not successful: ')
+
                 rospy.sleep(0.12)
             self.current_plan = []
 

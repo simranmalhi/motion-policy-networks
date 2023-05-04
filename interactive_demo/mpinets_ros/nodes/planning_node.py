@@ -22,24 +22,25 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import torch
-from mpinets.model import MotionPolicyNetwork
-from robofin.robots import FrankaRealRobot
-from robofin.pointcloud.torch import FrankaSampler
+import argparse
+import time
+from functools import partial
+from typing import Any, List, Tuple
+
 import numpy as np
+import rospy
+import torch
+import trimesh.transformations as tra
+from cv_bridge import CvBridge
+from geometrout.transform import SE3
+from mpinets.model import MotionPolicyNetwork
 from mpinets.utils import normalize_franka_joints, unnormalize_franka_joints
 from mpinets_msgs.msg import PlanningProblem
-from sensor_msgs.msg import PointCloud2, PointField
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from robofin.pointcloud.torch import FrankaSampler
+from robofin.robots import FrankaRealRobot
+from sensor_msgs.msg import CompressedImage, PointCloud2, PointField
 from std_msgs.msg import Header
-import time
-import trimesh.transformations as tra
-from functools import partial
-from geometrout.transform import SE3
-import argparse
-from typing import List, Tuple, Any
-
-import rospy
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 NUM_ROBOT_POINTS = 2048
 NUM_OBSTACLE_POINTS = 4096
@@ -104,7 +105,7 @@ class Planner:
         ), "Configuration is outside of feasible limits"
         q = torch.as_tensor(q0).cuda().unsqueeze(0).float()
         robot_points = self.fk_sampler.sample(q, NUM_ROBOT_POINTS)
-        point_cloud = torch.cat(
+        point_cloud = torch.cat( # Has dims [2048 + 4096 + 128, 4]
             (
                 torch.zeros(NUM_ROBOT_POINTS, 4),
                 torch.ones(NUM_OBSTACLE_POINTS, 4),
@@ -161,32 +162,47 @@ class PlanningNode:
 
         self.planner = None
         self.base_frame = "panda_link0"
+        self.full_scene_pc = None
+
         self.planning_problem_subscriber = rospy.Subscriber(
             "/mpinets/planning_problem",
             PlanningProblem,
             self.plan_callback,
             queue_size=1,
         )
-        self.full_point_cloud_publisher = rospy.Publisher(
-            "/mpinets/full_point_cloud", PointCloud2, queue_size=2
-        )
+        # self.full_point_cloud_publisher = rospy.Publisher( TODO: add back to debug reconstructed point cloud
+        #     "/mpinets/full_point_cloud", PointCloud2, queue_size=2
+        # )
         self.plan_publisher = rospy.Publisher(
             "/mpinets/plan", JointTrajectory, queue_size=1
         )
-        rospy.loginfo("Loading data")
-        self.load_point_cloud_data(
-            rospy.get_param("/mpinets_planning_node/point_cloud_path")
+        self.filtered_cloud_subscriber = rospy.Subscriber(
+            "/kinect_front/qhd/image_depth_rect_filtered/compressedDepth",
+            CompressedImage,
+            self.filtered_cloud_callback,
+            queue_size=2
         )
-        rospy.loginfo("Data loaded")
+
+        #rospy.loginfo("Loading data")
+        #self.load_point_cloud_data(
+        #    rospy.get_param("/mpinets_planning_node/point_cloud_path")
+        #)
+        #rospy.loginfo("Data loaded")
         rospy.loginfo("Loading model")
         self.planner = Planner(rospy.get_param("/mpinets_planning_node/mdl_path"))
         rospy.loginfo("Model loaded")
         rospy.loginfo("System ready")
 
+    def filtered_cloud_callback(self, msg:CompressedImage):
+        bridge = CvBridge()
+        cv_image = bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='passthrough') # imgmsg_to_cv2
+
+        self.full_scene_pc = np.asarray(cv_image)
+
     @staticmethod
     def clean_point_cloud(
-        xyz: np.ndarray, rgba: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        xyz: np.ndarray
+    ) -> np.ndarray:
         """
         Some points are outside of the feasible range and create artifacts for
         the network. This filters out those points and then downsamples to the right size
@@ -221,85 +237,85 @@ class PlanningNode:
         )
         workspace_mask = np.logical_or(task_tabletop_mask, mount_table_mask)
         xyz = xyz[workspace_mask]
-        rgba = rgba[workspace_mask]
         random_mask = np.random.choice(
             len(xyz), size=NUM_OBSTACLE_POINTS, replace=False
         )
-        return xyz[random_mask], rgba[random_mask]
+        return xyz[random_mask]
 
-    def load_point_cloud_data(self, path: str):
-        """
-        Loads scene from a point cloud file, transforms into the
-        'panda_link0' frame, stores it to the class, and starts a publishing
-        loop to show it
 
-        :param path str: The path to the point cloud file
-        """
+    # def load_point_cloud_data(self, path: str):
+    #     """
+    #     Loads scene from a point cloud file, transforms into the
+    #     'panda_link0' frame, stores it to the class, and starts a publishing
+    #     loop to show it
 
-        # Load the file
-        observation_data = np.load(
-            path,
-            allow_pickle=True,
-        ).item()
+    #     :param path str: The path to the point cloud file
+    #     """
 
-        # Transform it into the "world frame," i.e. `panda_link0`
-        full_pc = tra.transform_points(
-            observation_data["pc"], observation_data["camera_pose"]
-        )
+    #     # Load the file
+    #     observation_data = np.load(
+    #         path,
+    #         allow_pickle=True,
+    #     ).item()
 
-        # Remove the robot points
-        no_robot_mask = (
-            observation_data["label_map"]["robot"] != observation_data["pc_label"]
-        )
-        scene_pc = full_pc[no_robot_mask]
+    #     # Transform it into the "world frame," i.e. `panda_link0`
+    #     full_pc = tra.transform_points(
+    #         observation_data["pc"], observation_data["camera_pose"]
+    #     )
 
-        # Scale the color values to be within [0-1] and add alpha channel
-        scene_colors = observation_data["pc_color"][no_robot_mask] / 255.0
-        scene_colors = np.concatenate(
-            (scene_colors, np.ones((len(scene_colors), 1))), axis=1
-        )
-        assert scene_colors.shape[1] == 4
-        rospy.Timer(
-            rospy.Duration(1.0),
-            partial(self.publish_point_cloud_data, scene_pc, scene_colors),
-        )
-        self.full_scene_pc = scene_pc
-        self.full_scene_colors = scene_colors
+    #     # Remove the robot points
+    #     no_robot_mask = (
+    #         observation_data["label_map"]["robot"] != observation_data["pc_label"]
+    #     )
+    #     scene_pc = full_pc[no_robot_mask]
 
-    def publish_point_cloud_data(self, points: np.ndarray, colors: np.ndarray, _: Any):
-        """
-        Publishes the point cloud so that it can be visualized in Rviz
+    #     # Scale the color values to be within [0-1] and add alpha channel
+    #     scene_colors = observation_data["pc_color"][no_robot_mask] / 255.0
+    #     scene_colors = np.concatenate(
+    #         (scene_colors, np.ones((len(scene_colors), 1))), axis=1
+    #     )
+    #     assert scene_colors.shape[1] == 4
+    #     rospy.Timer(
+    #         rospy.Duration(1.0),
+    #         partial(self.publish_point_cloud_data, scene_pc, scene_colors),
+    #     )
+    #     self.full_scene_pc = scene_pc
+    #     self.full_scene_colors = scene_colors
 
-        :param points np.ndarray: The 3D locations of the point cloud (dimension N x 3)
-        :param colors np.ndarray: The color values of each point (dimension N x 4)
-        :param _ Any: This is a parameter necessary to run this within a rospy timing
-                      loop and is unused.
-        """
-        ros_dtype = PointField.FLOAT32
-        dtype = np.float32
-        itemsize = np.dtype(dtype).itemsize
-        assert points.shape[1] == 3
-        assert colors.shape[1] == 4
-        colors[:, -1] = 0.5
-        data = np.concatenate((points, colors), axis=1).astype(dtype)  # .tobytes()
-        data = data.tobytes()
-        fields = [
-            PointField(name=n, offset=i * itemsize, datatype=ros_dtype, count=1)
-            for i, n in enumerate("xyzrgba")
-        ]
-        header = Header(frame_id="panda_link0", stamp=rospy.Time.now())
-        msg = PointCloud2(
-            header=header,
-            height=1,
-            width=points.shape[0],
-            is_dense=False,
-            is_bigendian=False,
-            fields=fields,
-            point_step=(itemsize * 7),
-            row_step=(itemsize * 7 * points.shape[0]),
-            data=data,
-        )
-        self.full_point_cloud_publisher.publish(msg)
+    # def publish_point_cloud_data(self, points: np.ndarray, colors: np.ndarray, _: Any):
+    #     """
+    #     Publishes the point cloud so that it can be visualized in Rviz
+
+    #     :param points np.ndarray: The 3D locations of the point cloud (dimension N x 3)
+    #     :param colors np.ndarray: The color values of each point (dimension N x 4)
+    #     :param _ Any: This is a parameter necessary to run this within a rospy timing
+    #                   loop and is unused.
+    #     """
+    #     ros_dtype = PointField.FLOAT32
+    #     dtype = np.float32
+    #     itemsize = np.dtype(dtype).itemsize
+    #     assert points.shape[1] == 3
+    #     assert colors.shape[1] == 4
+    #     colors[:, -1] = 0.5
+    #     data = np.concatenate((points, colors), axis=1).astype(dtype)  # .tobytes()
+    #     data = data.tobytes()
+    #     fields = [
+    #         PointField(name=n, offset=i * itemsize, datatype=ros_dtype, count=1)
+    #         for i, n in enumerate("xyzrgba")
+    #     ]
+    #     header = Header(frame_id="panda_link0", stamp=rospy.Time.now())
+    #     msg = PointCloud2(
+    #         header=header,
+    #         height=1,
+    #         width=points.shape[0],
+    #         is_dense=False,
+    #         is_bigendian=False,
+    #         fields=fields,
+    #         point_step=(itemsize * 7),
+    #         row_step=(itemsize * 7 * points.shape[0]),
+    #         data=data,
+    #     )
+    #     self.full_point_cloud_publisher.publish(msg)
 
     def plan_callback(self, msg: PlanningProblem):
         """
@@ -322,9 +338,7 @@ class PlanningNode:
                 msg.target.transform.rotation.z,
             ],
         )
-        scene_pc, scene_colors = self.clean_point_cloud(
-            self.full_scene_pc, self.full_scene_colors
-        )
+        scene_pc = self.clean_point_cloud(self.full_scene_pc)
         if self.planner is None:
             rospy.logwarn("Model is not yet loaded and planner cannot yet be called")
             return
